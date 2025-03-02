@@ -1,0 +1,8 @@
+[package]
+name = "ronto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2.169"
+termios = "0.3.3"
