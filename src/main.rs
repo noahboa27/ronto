@@ -29,13 +29,9 @@ struct EditorConfig {
     cursor_y: u16,
     screen_rows: u16,
     screen_cols: u16,
+    row: String,
+    num_of_rows: u32,
     orig_termios: Termios,
-}
-
-#[derive(Debug)]
-struct ERow {
-    size: u32,
-    line: String,
 }
 
 fn main() {
@@ -44,32 +40,36 @@ fn main() {
     let mut buf_writer = BufWriter::new(io::stdout());
     let stdin_fd = stdin.as_raw_fd();
     let orig_termios = Termios::from_fd(stdin_fd).unwrap();
-    let mut editor_config = EditorConfig {
+    let mut config = EditorConfig {
         cursor_x: 0u16,
         cursor_y: 0u16,
         screen_rows: 0u16,
         screen_cols: 0u16,
+        row: String::new(),
+        num_of_rows: 0,
         orig_termios,
     };
+
+    editor_open(&mut config);
 
     if let Err(e) = enable_raw_mode(stdin_fd) {
         die(e)
     };
 
-    set_window_size(&mut stdin, &mut stdout, &mut editor_config);
+    set_window_size(&mut stdin, &mut stdout, &mut config);
 
     loop {
-        if let Err(e) = editor_refresh_screen(&mut buf_writer, &editor_config) {
+        if let Err(e) = editor_refresh_screen(&mut buf_writer, &config) {
             die(e)
         };
-        match editor_process_keypress(&mut stdin, &mut buf_writer, &mut editor_config) {
+        match editor_process_keypress(&mut stdin, &mut buf_writer, &mut config) {
             Ok(Some(())) => break,
             Err(e) => die(e),
             _ => (),
         };
     }
 
-    if let Err(e) = disable_raw_mode(stdin_fd, &editor_config.orig_termios) {
+    if let Err(e) = disable_raw_mode(stdin_fd, &config.orig_termios) {
         die(e)
     }
     process::exit(0);
@@ -78,6 +78,14 @@ fn main() {
 const fn ctrl_key(key: u8) -> u16 {
     // mask to strip away the CTRL key bits
     (key & 0x1f) as u16
+}
+
+/////////////////////////////////////// FILE I/O ////////////////////////////////////////
+
+fn editor_open(config: &mut EditorConfig) {
+    let line = String::from("super duper long line found on some lost planet in the universe");
+    config.row = line;
+    config.num_of_rows = 1;
 }
 
 /////////////////////////////////////// TERMINAL ////////////////////////////////////////
@@ -173,7 +181,7 @@ fn editor_read_key(stdin: &mut Stdin) -> io::Result<u16> {
 fn set_window_size(
     stdin: &mut Stdin,
     stdout: &mut Stdout,
-    editor_config: &mut EditorConfig,
+    config: &mut EditorConfig,
 ) -> io::Result<()> {
     let ws = winsize {
         ws_row: 0,
@@ -184,12 +192,12 @@ fn set_window_size(
 
     if unsafe { ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 } || ws.ws_col == 0 {
         let (rows, cols) = get_window_size_from_cursor(stdin, stdout)?;
-        editor_config.screen_rows = rows;
-        editor_config.screen_cols = cols;
+        config.screen_rows = rows;
+        config.screen_cols = cols;
         Ok(())
     } else {
-        editor_config.screen_rows = ws.ws_row;
-        editor_config.screen_cols = ws.ws_col;
+        config.screen_rows = ws.ws_row;
+        config.screen_cols = ws.ws_col;
         Ok(())
     }
 }
@@ -227,62 +235,62 @@ fn get_window_size_from_cursor(stdin: &mut Stdin, stdout: &mut Stdout) -> io::Re
 fn editor_process_keypress(
     stdin: &mut Stdin,
     buf_writer: &mut BufWriter<Stdout>,
-    editor_config: &mut EditorConfig,
+    config: &mut EditorConfig,
 ) -> io::Result<Option<()>> {
     let key: u16 = editor_read_key(stdin)?;
     match key {
         CTRL_Q => {
-            editor_refresh_screen(buf_writer, editor_config)?;
+            editor_refresh_screen(buf_writer, config)?;
             Ok(Some(()))
         }
         ARROW_UP | ARROW_DOWN | ARROW_LEFT | ARROW_RIGHT => {
-            editor_move_cursor(key, editor_config);
+            editor_move_cursor(key, config);
             Ok(None)
         }
         PAGE_UP | PAGE_DOWN => {
-            let mut times = editor_config.screen_rows;
+            let mut times = config.screen_rows;
             while times > 0 {
                 if key == PAGE_UP {
-                    editor_move_cursor(ARROW_UP, editor_config);
+                    editor_move_cursor(ARROW_UP, config);
                 } else {
-                    editor_move_cursor(ARROW_DOWN, editor_config);
+                    editor_move_cursor(ARROW_DOWN, config);
                 }
                 times -= 1;
             }
             Ok(None)
         }
         HOME_KEY => {
-            editor_config.cursor_x = 0;
+            config.cursor_x = 0;
             Ok(None)
         }
         END_KEY => {
-            editor_config.cursor_x = editor_config.screen_cols - 1;
+            config.cursor_x = config.screen_cols - 1;
             Ok(None)
         }
         _ => Ok(None),
     }
 }
 
-fn editor_move_cursor(key: u16, editor_config: &mut EditorConfig) {
+fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
     match key {
         ARROW_UP => {
-            if editor_config.cursor_y != 0 {
-                editor_config.cursor_y -= 1
+            if config.cursor_y != 0 {
+                config.cursor_y -= 1
             }
         }
         ARROW_LEFT => {
-            if editor_config.cursor_x != 0 {
-                editor_config.cursor_x -= 1
+            if config.cursor_x != 0 {
+                config.cursor_x -= 1
             }
         }
         ARROW_DOWN => {
-            if editor_config.cursor_y != editor_config.screen_rows - 1 {
-                editor_config.cursor_y += 1
+            if config.cursor_y != config.screen_rows - 1 {
+                config.cursor_y += 1
             }
         }
         ARROW_RIGHT => {
-            if editor_config.cursor_x != editor_config.screen_cols - 1 {
-                editor_config.cursor_x += 1
+            if config.cursor_x != config.screen_cols - 1 {
+                config.cursor_x += 1
             }
         }
         _ => (),
@@ -293,14 +301,14 @@ fn editor_move_cursor(key: u16, editor_config: &mut EditorConfig) {
 
 fn editor_refresh_screen(
     buf_writer: &mut BufWriter<Stdout>,
-    editor_config: &EditorConfig,
+    config: &EditorConfig,
 ) -> io::Result<()> {
     // hide the cursor
     buf_writer.write(b"\x1b[?25l")?;
     // ansi cursor home code
     buf_writer.write(b"\x1b[H")?;
 
-    editor_draw_rows(buf_writer, editor_config)?;
+    editor_draw_rows(buf_writer, config)?;
 
     // CONSIDERATION: rewrite without making a heap allocation
     // let mut buf = [0u8, 32];
@@ -310,15 +318,12 @@ fn editor_refresh_screen(
     //     "\x1b[{};{}H",
     //     16u16,
     //     16u16,
-    //     // editor_config.cursor_y,
-    //     // editor_config.cursor_x
+    //     // config.cursor_y,
+    //     // config.cursor_x
     // )?;
     // buf_writer.write(cursor.get_ref())?;
 
-    let cursor_pos = format!(
-        "\x1b[{};{}H",
-        editor_config.cursor_y, editor_config.cursor_x
-    );
+    let cursor_pos = format!("\x1b[{};{}H", config.cursor_y, config.cursor_x);
     buf_writer.write(cursor_pos.as_bytes())?;
 
     // buf_writer.write(b"\x1b[H")?;
@@ -329,33 +334,34 @@ fn editor_refresh_screen(
     Ok(())
 }
 
-fn editor_draw_rows(
-    buf_writer: &mut BufWriter<Stdout>,
-    editor_config: &EditorConfig,
-) -> io::Result<()> {
-    for i in 0..editor_config.screen_rows {
-        if i == editor_config.screen_rows / 3 {
-            // CONSIDERATION: rewrite without making a heap allocation
-            // let mut buf = [0u8, 80];
-            // let welcome = write!(buf, "Ronto editor --version {}", RONTO_VERSION);
+fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) -> io::Result<()> {
+    for y in 0..config.screen_rows {
+        if y as u32 >= config.num_of_rows {
+            if y == config.screen_rows / 3 {
+                // CONSIDERATION: rewrite without making a heap allocation
+                // let mut buf = [0u8, 80];
+                // let welcome = write!(buf, "Ronto editor --version {}", RONTO_VERSION);
 
-            let welcome = format!("Ronto editor -- version {RONTO_VERSION}");
-            let mut padding = (editor_config.screen_cols - welcome.len() as u16) / 2;
-            buf_writer.write(b"~")?;
-            padding -= 1;
-            while padding > 0 {
-                buf_writer.write(b" ")?;
+                let welcome = format!("Ronto editor -- version {RONTO_VERSION}");
+                let mut padding = (config.screen_cols - welcome.len() as u16) / 2;
+                buf_writer.write(b"~")?;
                 padding -= 1;
-            }
+                while padding > 0 {
+                    buf_writer.write(b" ")?;
+                    padding -= 1;
+                }
 
-            buf_writer.write(welcome.as_bytes())?;
+                buf_writer.write(welcome.as_bytes())?;
+            } else {
+                buf_writer.write(b"~")?;
+            }
         } else {
-            buf_writer.write(b"~")?;
+            buf_writer.write(config.row.as_bytes())?;
         }
 
         // erases part of the line to the right of the cursor
         buf_writer.write(b"\x1b[K")?;
-        if i < editor_config.screen_rows - 1 {
+        if y < config.screen_rows - 1 {
             buf_writer.write(b"\r\n")?;
         }
     }
