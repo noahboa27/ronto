@@ -1,17 +1,18 @@
 use core::str;
 use libc::{ioctl, winsize, STDOUT_FILENO, TIOCGWINSZ};
+use std::env;
 use std::error::Error;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 use std::io::{BufWriter, Read, Stdin, Stdout, Write};
-// use std::env;
-// use std::path;
-use std::process;
-// use std::fs::File;
-use std::io;
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
+use std::process;
 use termios::*;
 
 const ESC: u8 = b'\x1b';
-const CTRL_Q: u16 = ctrl_key(b'q');
+const KEY_Q: u8 = b'q';
+const CTRL_Q: u16 = ctrl_key(KEY_Q);
 const ARROW_UP: u16 = 1000;
 const ARROW_LEFT: u16 = 1001;
 const ARROW_DOWN: u16 = 1002;
@@ -25,16 +26,23 @@ const RONTO_VERSION: &'static str = "0.0.1";
 
 #[derive(Debug)]
 struct EditorConfig {
-    cursor_x: u16,
-    cursor_y: u16,
-    screen_rows: u16,
-    screen_cols: u16,
-    row: String,
-    num_of_rows: u32,
+    cursor_x: u16,      // x coordinate of the cursor
+    cursor_y: u16,      // y coordinate of the cursor
+    row_offset: u16,    // row offset from the top 0
+    column_offset: u16, // column offset from the left 0
+    screen_rows: u16,   // how many rows the terminal can display
+    screen_cols: u16,   // how many columns the terminal can display
+    rows: Vec<String>,  // collection of rows for the file
     orig_termios: Termios,
 }
 
 fn main() {
+    let num_of_args = env::args().len();
+    if num_of_args < 1 || num_of_args > 2 {
+        println!("Usage: ronto <path/to/file>");
+        process::exit(1);
+    }
+
     let mut stdout = io::stdout();
     let mut stdin = io::stdin();
     let mut buf_writer = BufWriter::new(io::stdout());
@@ -43,14 +51,20 @@ fn main() {
     let mut config = EditorConfig {
         cursor_x: 0u16,
         cursor_y: 0u16,
+        row_offset: 0u16,
+        column_offset: 0u16,
         screen_rows: 0u16,
         screen_cols: 0u16,
-        row: String::new(),
-        num_of_rows: 0,
+        rows: Vec::new(),
         orig_termios,
     };
 
-    editor_open(&mut config);
+    if num_of_args == 2 {
+        let filename = env::args().last().unwrap();
+        if let Err(e) = editor_open(&mut config, &filename) {
+            die(e)
+        };
+    }
 
     if let Err(e) = enable_raw_mode(stdin_fd) {
         die(e)
@@ -59,7 +73,7 @@ fn main() {
     set_window_size(&mut stdin, &mut stdout, &mut config);
 
     loop {
-        if let Err(e) = editor_refresh_screen(&mut buf_writer, &config) {
+        if let Err(e) = editor_refresh_screen(&mut buf_writer, &mut config) {
             die(e)
         };
         match editor_process_keypress(&mut stdin, &mut buf_writer, &mut config) {
@@ -82,10 +96,16 @@ const fn ctrl_key(key: u8) -> u16 {
 
 /////////////////////////////////////// FILE I/O ////////////////////////////////////////
 
-fn editor_open(config: &mut EditorConfig) {
-    let line = String::from("super duper long line found on some lost planet in the universe");
-    config.row = line;
-    config.num_of_rows = 1;
+fn editor_open(config: &mut EditorConfig, filename: &str) -> io::Result<()> {
+    let file_handle = File::open(filename)?;
+    let reader = BufReader::new(file_handle);
+
+    for line in reader.lines() {
+        let line = line?;
+        config.rows.push(line);
+    }
+
+    Ok(())
 }
 
 /////////////////////////////////////// TERMINAL ////////////////////////////////////////
@@ -228,8 +248,6 @@ fn get_window_size_from_cursor(stdin: &mut Stdin, stdout: &mut Stdout) -> io::Re
     Ok((rows, cols))
 }
 
-/////////////////////////////////////////////////////////////////////////////////////////
-
 /////////////////////////////////////// INPUT ///////////////////////////////////////////
 
 fn editor_process_keypress(
@@ -284,7 +302,7 @@ fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
             }
         }
         ARROW_DOWN => {
-            if config.cursor_y != config.screen_rows - 1 {
+            if (config.cursor_y as usize) < config.rows.len() {
                 config.cursor_y += 1
             }
         }
@@ -301,8 +319,10 @@ fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
 
 fn editor_refresh_screen(
     buf_writer: &mut BufWriter<Stdout>,
-    config: &EditorConfig,
+    config: &mut EditorConfig,
 ) -> io::Result<()> {
+    editor_scroll(config);
+
     // hide the cursor
     buf_writer.write(b"\x1b[?25l")?;
     // ansi cursor home code
@@ -323,10 +343,13 @@ fn editor_refresh_screen(
     // )?;
     // buf_writer.write(cursor.get_ref())?;
 
-    let cursor_pos = format!("\x1b[{};{}H", config.cursor_y, config.cursor_x);
+    let cursor_pos = format!(
+        "\x1b[{};{}H",
+        (config.cursor_y - config.row_offset) + 1,
+        config.cursor_x + 1
+    );
     buf_writer.write(cursor_pos.as_bytes())?;
 
-    // buf_writer.write(b"\x1b[H")?;
     // show the cursor
     buf_writer.write(b"\x1b[?25h")?;
     buf_writer.flush()?;
@@ -334,10 +357,21 @@ fn editor_refresh_screen(
     Ok(())
 }
 
+fn editor_scroll(config: &mut EditorConfig) {
+    if config.cursor_y < config.row_offset {
+        config.row_offset = config.cursor_y;
+    }
+    if config.cursor_y >= config.row_offset + config.screen_rows {
+        config.row_offset = config.cursor_y - config.screen_rows + 1;
+    }
+}
+
 fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) -> io::Result<()> {
     for y in 0..config.screen_rows {
-        if y as u32 >= config.num_of_rows {
-            if y == config.screen_rows / 3 {
+        let filerow = y + config.row_offset;
+        let filerow = filerow as usize;
+        if filerow >= config.rows.len() {
+            if config.rows.len() == 0 && y == config.screen_rows / 3 {
                 // CONSIDERATION: rewrite without making a heap allocation
                 // let mut buf = [0u8, 80];
                 // let welcome = write!(buf, "Ronto editor --version {}", RONTO_VERSION);
@@ -356,7 +390,15 @@ fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) -
                 buf_writer.write(b"~")?;
             }
         } else {
-            buf_writer.write(config.row.as_bytes())?;
+            let line = &config.rows[filerow];
+            let mut len = line.len() - config.column_offset as usize;
+
+            if line.len() > config.screen_cols as usize {
+                let short_line = &line[..config.screen_cols as usize];
+                buf_writer.write(short_line.as_bytes())?;
+            } else {
+                buf_writer.write(line.as_bytes())?;
+            }
         }
 
         // erases part of the line to the right of the cursor
