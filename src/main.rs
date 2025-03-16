@@ -1,3 +1,18 @@
+////////////////////////////////////////////////////////////////////////////////
+// This program is free software: you can redistribute it and/or modify it    //
+// under the terms of the GNU General Public License as published by the      //
+// Free Software Foundation, either version 3 of the License, or              //
+// (at your option) any later version.                                        //
+//                                                                            //
+// This program is distributed in the hope that it will be useful, but        //
+// WITHOUT ANY WARRANTY; without even the implied warranty of                 //
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU           //
+// General Public License for more details.                                   //
+//                                                                            //
+// You should have received a copy of the GNU General Public License along    //
+// with this program. If not, see <https://www.gnu.org/licenses/>.            //
+////////////////////////////////////////////////////////////////////////////////
+
 use core::str;
 use libc::{ioctl, winsize, STDOUT_FILENO, TIOCGWINSZ};
 use std::env;
@@ -26,13 +41,13 @@ const RONTO_VERSION: &'static str = "0.0.1";
 
 #[derive(Debug)]
 struct EditorConfig {
-    cursor_x: u16,      // x coordinate of the cursor
-    cursor_y: u16,      // y coordinate of the cursor
-    row_offset: u16,    // row offset from the top 0
-    column_offset: u16, // column offset from the left 0
-    screen_rows: u16,   // how many rows the terminal can display
-    screen_cols: u16,   // how many columns the terminal can display
-    rows: Vec<String>,  // collection of rows for the file
+    cursor_x: usize,      // x coordinate of the cursor in the file
+    cursor_y: usize,      // y coordinate of the cursor in the file
+    row_offset: usize,    // refers to the top of the screen
+    column_offset: usize, // refers to the left of the screen
+    screen_rows: usize,   // how many rows the terminal can display
+    screen_cols: usize,   // how many columns the terminal can display
+    rows: Vec<String>,    // collection of rows for the file
     orig_termios: Termios,
 }
 
@@ -49,12 +64,12 @@ fn main() {
     let stdin_fd = stdin.as_raw_fd();
     let orig_termios = Termios::from_fd(stdin_fd).unwrap();
     let mut config = EditorConfig {
-        cursor_x: 0u16,
-        cursor_y: 0u16,
-        row_offset: 0u16,
-        column_offset: 0u16,
-        screen_rows: 0u16,
-        screen_cols: 0u16,
+        cursor_x: 0usize,
+        cursor_y: 0usize,
+        row_offset: 0usize,
+        column_offset: 0usize,
+        screen_rows: 0usize,
+        screen_cols: 0usize,
         rows: Vec::new(),
         orig_termios,
     };
@@ -70,7 +85,9 @@ fn main() {
         die(e)
     };
 
-    set_window_size(&mut stdin, &mut stdout, &mut config);
+    if let Err(e) = set_window_size(&mut stdin, &mut stdout, &mut config) {
+        die(e)
+    };
 
     loop {
         if let Err(e) = editor_refresh_screen(&mut buf_writer, &mut config) {
@@ -212,12 +229,12 @@ fn set_window_size(
 
     if unsafe { ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 } || ws.ws_col == 0 {
         let (rows, cols) = get_window_size_from_cursor(stdin, stdout)?;
-        config.screen_rows = rows;
-        config.screen_cols = cols;
+        config.screen_rows = rows as usize;
+        config.screen_cols = cols as usize;
         Ok(())
     } else {
-        config.screen_rows = ws.ws_row;
-        config.screen_cols = ws.ws_col;
+        config.screen_rows = ws.ws_row as usize;
+        config.screen_cols = ws.ws_col as usize;
         Ok(())
     }
 }
@@ -290,6 +307,12 @@ fn editor_process_keypress(
 }
 
 fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
+    let row = if config.cursor_y >= config.rows.len() {
+        None
+    } else {
+        Some(&config.rows[config.cursor_y])
+    };
+
     match key {
         ARROW_UP => {
             if config.cursor_y != 0 {
@@ -302,12 +325,12 @@ fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
             }
         }
         ARROW_DOWN => {
-            if (config.cursor_y as usize) < config.rows.len() {
+            if (config.cursor_y) < config.rows.len() {
                 config.cursor_y += 1
             }
         }
         ARROW_RIGHT => {
-            if config.cursor_x != config.screen_cols - 1 {
+            if row.is_some() && config.cursor_x < row.unwrap().len() {
                 config.cursor_x += 1
             }
         }
@@ -346,7 +369,7 @@ fn editor_refresh_screen(
     let cursor_pos = format!(
         "\x1b[{};{}H",
         (config.cursor_y - config.row_offset) + 1,
-        config.cursor_x + 1
+        (config.cursor_x - config.column_offset) + 1
     );
     buf_writer.write(cursor_pos.as_bytes())?;
 
@@ -361,15 +384,23 @@ fn editor_scroll(config: &mut EditorConfig) {
     if config.cursor_y < config.row_offset {
         config.row_offset = config.cursor_y;
     }
+
     if config.cursor_y >= config.row_offset + config.screen_rows {
         config.row_offset = config.cursor_y - config.screen_rows + 1;
+    }
+
+    if config.cursor_x < config.column_offset {
+        config.column_offset = config.cursor_x;
+    }
+
+    if config.cursor_x >= config.column_offset + config.screen_cols {
+        config.column_offset = config.cursor_x - config.screen_cols + 1;
     }
 }
 
 fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) -> io::Result<()> {
     for y in 0..config.screen_rows {
         let filerow = y + config.row_offset;
-        let filerow = filerow as usize;
         if filerow >= config.rows.len() {
             if config.rows.len() == 0 && y == config.screen_rows / 3 {
                 // CONSIDERATION: rewrite without making a heap allocation
@@ -377,7 +408,7 @@ fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) -
                 // let welcome = write!(buf, "Ronto editor --version {}", RONTO_VERSION);
 
                 let welcome = format!("Ronto editor -- version {RONTO_VERSION}");
-                let mut padding = (config.screen_cols - welcome.len() as u16) / 2;
+                let mut padding = (config.screen_cols - welcome.len()) / 2;
                 buf_writer.write(b"~")?;
                 padding -= 1;
                 while padding > 0 {
@@ -391,12 +422,18 @@ fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) -
             }
         } else {
             let line = &config.rows[filerow];
-            let mut len = line.len() - config.column_offset as usize;
+            // returns 0 if result would be negative
+            let line_len = line.len().saturating_sub(config.column_offset);
 
-            if line.len() > config.screen_cols as usize {
-                let short_line = &line[..config.screen_cols as usize];
-                buf_writer.write(short_line.as_bytes())?;
+            if line_len > config.screen_cols {
+                let line = &line[..config.screen_cols];
+                buf_writer.write(line.as_bytes())?;
             } else {
+                let line = if line_len == 0 {
+                    ""
+                } else {
+                    &line[config.column_offset..]
+                };
                 buf_writer.write(line.as_bytes())?;
             }
         }
