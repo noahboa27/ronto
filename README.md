@@ -1,7 +1,7 @@
 # ronto
 
-A simple, barebones text editor for the terminal. This project is meant to be
-practice for me to learn and build my Rust skills. I choose this as my project because I wanted a
-behind the scenes look at how such an editor works. Also because there is nice guide written in C
-for such a project (https://viewsourcecode.org/snaptoken/kilo/). I have learned much about the 
-terminal and the C language during this process and can't wait for what's ahead!
+ronto is rewrite of the Kilo editor: https://github.com/antirez/kilo
+
+I chose to rewrite this program after finding this [guide](https://viewsourcecode.org/snaptoken/kilo/index.html).
+With the project being less than 1000 lines of code and having a clear goal, I figured it would
+be the perfect opportunity to get a good grip on the basics of Rust.
