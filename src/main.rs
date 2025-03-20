@@ -1,17 +1,23 @@
-////////////////////////////////////////////////////////////////////////////////
-// This program is free software: you can redistribute it and/or modify it    //
-// under the terms of the GNU General Public License as published by the      //
-// Free Software Foundation, either version 3 of the License, or              //
-// (at your option) any later version.                                        //
-//                                                                            //
-// This program is distributed in the hope that it will be useful, but        //
-// WITHOUT ANY WARRANTY; without even the implied warranty of                 //
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU           //
-// General Public License for more details.                                   //
-//                                                                            //
-// You should have received a copy of the GNU General Public License along    //
-// with this program. If not, see <https://www.gnu.org/licenses/>.            //
-////////////////////////////////////////////////////////////////////////////////
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice,
+//   this list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice,
+//   this list of conditions and the following disclaimer in the documentation
+//   and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+// ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+// ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use core::str;
 use libc::{ioctl, winsize, STDOUT_FILENO, TIOCGWINSZ};
@@ -38,17 +44,28 @@ const HOME_KEY: u16 = 1006;
 const END_KEY: u16 = 1007;
 const DEL_KEY: u16 = 1008;
 const RONTO_VERSION: &'static str = "0.0.1";
+const RONTO_STATUS: &'static str = "  ronto 0.0.1";
+const NO_FILENAME: &'static str = "[No Name]";
+const TAB_STOP: usize = 8;
 
 #[derive(Debug)]
 struct EditorConfig {
     cursor_x: usize,      // x coordinate of the cursor in the file
     cursor_y: usize,      // y coordinate of the cursor in the file
-    row_offset: usize,    // refers to the top of the screen
-    column_offset: usize, // refers to the left of the screen
+    render_x: usize,      // x coordinate of the render
+    row_offset: usize,    // keeps track of what row you are on
+    column_offset: usize, // keeps track of what column you are on
     screen_rows: usize,   // how many rows the terminal can display
     screen_cols: usize,   // how many columns the terminal can display
-    rows: Vec<String>,    // collection of rows for the file
+    rows: Vec<ERow>,      // collection of rows for the file
+    filename: String,
     orig_termios: Termios,
+}
+
+#[derive(Debug)]
+struct ERow {
+    line: String,
+    render: String,
 }
 
 fn main() {
@@ -66,17 +83,19 @@ fn main() {
     let mut config = EditorConfig {
         cursor_x: 0usize,
         cursor_y: 0usize,
+        render_x: 0usize,
         row_offset: 0usize,
         column_offset: 0usize,
         screen_rows: 0usize,
         screen_cols: 0usize,
         rows: Vec::new(),
+        filename: String::new(),
         orig_termios,
     };
 
     if num_of_args == 2 {
-        let filename = env::args().last().unwrap();
-        if let Err(e) = editor_open(&mut config, &filename) {
+        config.filename = env::args().last().unwrap();
+        if let Err(e) = editor_open(&mut config) {
             die(e)
         };
     }
@@ -103,7 +122,8 @@ fn main() {
     if let Err(e) = disable_raw_mode(stdin_fd, &config.orig_termios) {
         die(e)
     }
-    process::exit(0);
+
+    shutdown();
 }
 
 const fn ctrl_key(key: u8) -> u16 {
@@ -113,19 +133,79 @@ const fn ctrl_key(key: u8) -> u16 {
 
 /////////////////////////////////////// FILE I/O ////////////////////////////////////////
 
-fn editor_open(config: &mut EditorConfig, filename: &str) -> io::Result<()> {
-    let file_handle = File::open(filename)?;
+fn editor_open(config: &mut EditorConfig) -> io::Result<()> {
+    let file_handle = File::open(&config.filename)?;
     let reader = BufReader::new(file_handle);
 
     for line in reader.lines() {
         let line = line?;
-        config.rows.push(line);
+        let render = render_line(&line);
+
+        let erow = ERow { line, render };
+        config.rows.push(erow);
     }
 
     Ok(())
 }
 
+/////////////////////////////////////// ROW OPERATIONS //////////////////////////////////
+
+fn render_line(line: &str) -> String {
+    let mut len: usize = 0;
+    for c in line.chars() {
+        if c == '\t' {
+            len += TAB_STOP;
+        } else {
+            len += 1;
+        }
+    }
+    let mut render = String::with_capacity(len);
+
+    let mut index: usize = 0;
+    for c in line.chars() {
+        if c == '\t' {
+            render.push(' ');
+            index += 1;
+            while index % TAB_STOP != 0 {
+                render.push(' ');
+                index += 1;
+            }
+        } else {
+            render.push(c);
+        }
+    }
+
+    render
+}
+
+fn editor_row_cursorx_to_renderx(row: &str, cx: usize) -> usize {
+    let mut rx: usize = 0;
+    let chars = row.chars().take(cx);
+
+    for c in chars {
+        if c == '\t' {
+            rx += (TAB_STOP - 1) - (rx % TAB_STOP);
+        }
+        rx += 1;
+    }
+
+    rx
+}
+
 /////////////////////////////////////// TERMINAL ////////////////////////////////////////
+
+fn shutdown() {
+    let mut stdout = io::stdout();
+
+    // ansi screen clear code
+    stdout.write_all(b"\x1b[2J");
+    stdout.flush();
+    // ansi cursor home code
+    stdout.write_all(b"\x1b[H");
+    stdout.flush();
+
+    process::exit(0);
+}
 
 fn die<T: Error>(e: T) {
     let mut stdout = io::stdout();
@@ -231,12 +311,13 @@ fn set_window_size(
         let (rows, cols) = get_window_size_from_cursor(stdin, stdout)?;
         config.screen_rows = rows as usize;
         config.screen_cols = cols as usize;
-        Ok(())
     } else {
         config.screen_rows = ws.ws_row as usize;
         config.screen_cols = ws.ws_col as usize;
-        Ok(())
     }
+
+    config.screen_rows -= 4;
+    Ok(())
 }
 
 fn get_window_size_from_cursor(stdin: &mut Stdin, stdout: &mut Stdout) -> io::Result<(u16, u16)> {
@@ -283,6 +364,12 @@ fn editor_process_keypress(
             Ok(None)
         }
         PAGE_UP | PAGE_DOWN => {
+            if key == PAGE_UP {
+                config.cursor_y = config.row_offset;
+            } else if key == PAGE_DOWN {
+                config.cursor_y = config.row_offset + config.screen_rows - 1;
+            }
+
             let mut times = config.screen_rows;
             while times > 0 {
                 if key == PAGE_UP {
@@ -299,7 +386,9 @@ fn editor_process_keypress(
             Ok(None)
         }
         END_KEY => {
-            config.cursor_x = config.screen_cols - 1;
+            if config.cursor_y < config.rows.len() {
+                config.cursor_x = config.rows[config.cursor_y].line.len();
+            }
             Ok(None)
         }
         _ => Ok(None),
@@ -322,6 +411,9 @@ fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
         ARROW_LEFT => {
             if config.cursor_x != 0 {
                 config.cursor_x -= 1
+            } else if config.cursor_y > 0 {
+                config.cursor_y -= 1;
+                config.cursor_x = config.rows[config.cursor_y].line.len();
             }
         }
         ARROW_DOWN => {
@@ -330,11 +422,29 @@ fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
             }
         }
         ARROW_RIGHT => {
-            if row.is_some() && config.cursor_x < row.unwrap().len() {
+            if row.is_some() && config.cursor_x < row.unwrap().line.len() {
                 config.cursor_x += 1
+            } else if row.is_some() && config.cursor_x == row.unwrap().line.len() {
+                config.cursor_y += 1;
+                config.cursor_x = 0;
             }
         }
         _ => (),
+    }
+
+    let row = if config.cursor_y >= config.rows.len() {
+        None
+    } else {
+        Some(&config.rows[config.cursor_y])
+    };
+
+    let row_len = if row.is_some() {
+        row.unwrap().line.len()
+    } else {
+        0
+    };
+    if config.cursor_x > row_len {
+        config.cursor_x = row_len
     }
 }
 
@@ -351,7 +461,9 @@ fn editor_refresh_screen(
     // ansi cursor home code
     buf_writer.write(b"\x1b[H")?;
 
+    editor_draw_top_status_bar(buf_writer, config)?;
     editor_draw_rows(buf_writer, config)?;
+    editor_draw_bottom_status_bar(buf_writer, config)?;
 
     // CONSIDERATION: rewrite without making a heap allocation
     // let mut buf = [0u8, 32];
@@ -368,8 +480,8 @@ fn editor_refresh_screen(
 
     let cursor_pos = format!(
         "\x1b[{};{}H",
-        (config.cursor_y - config.row_offset) + 1,
-        (config.cursor_x - config.column_offset) + 1
+        (config.cursor_y - config.row_offset) + 2,
+        (config.render_x - config.column_offset) + 1
     );
     buf_writer.write(cursor_pos.as_bytes())?;
 
@@ -381,6 +493,12 @@ fn editor_refresh_screen(
 }
 
 fn editor_scroll(config: &mut EditorConfig) {
+    config.render_x = config.cursor_x;
+    if config.cursor_y < config.rows.len() {
+        config.render_x =
+            editor_row_cursorx_to_renderx(&config.rows[config.cursor_y].line, config.cursor_x);
+    }
+
     if config.cursor_y < config.row_offset {
         config.row_offset = config.cursor_y;
     }
@@ -390,12 +508,53 @@ fn editor_scroll(config: &mut EditorConfig) {
     }
 
     if config.cursor_x < config.column_offset {
-        config.column_offset = config.cursor_x;
+        config.column_offset = config.render_x;
     }
 
     if config.cursor_x >= config.column_offset + config.screen_cols {
-        config.column_offset = config.cursor_x - config.screen_cols + 1;
+        config.column_offset = config.render_x - config.screen_cols + 1;
     }
+}
+
+fn editor_draw_top_status_bar(
+    buf_writer: &mut BufWriter<Stdout>,
+    config: &EditorConfig,
+) -> io::Result<()> {
+    // clears line
+    buf_writer.write(b"\x1b[2K")?;
+    // invert colors
+    buf_writer.write(b"\x1b[7m")?;
+
+    buf_writer.write(RONTO_STATUS.as_bytes())?;
+
+    let filename = if !config.filename.is_empty() {
+        &config.filename
+    } else {
+        NO_FILENAME
+    };
+    let filename_len = filename.len();
+    let right_padding = (config.screen_cols - filename_len) / 2;
+    let left_padding = right_padding - RONTO_STATUS.len();
+
+    for _ in 0..left_padding {
+        buf_writer.write(b" ")?;
+    }
+
+    buf_writer.write(filename.as_bytes())?;
+
+    for _ in 0..right_padding {
+        buf_writer.write(b" ")?;
+    }
+
+    if filename_len % 2 == 0 {
+        buf_writer.write(b" ")?;
+    }
+
+    // reverts colors
+    buf_writer.write(b"\x1b[m")?;
+    // newline
+    buf_writer.write(b"\r\n")?;
+    Ok(())
 }
 
 fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) -> io::Result<()> {
@@ -421,7 +580,7 @@ fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) -
                 buf_writer.write(b"~")?;
             }
         } else {
-            let line = &config.rows[filerow];
+            let line = &config.rows[filerow].render;
             // returns 0 if result would be negative
             let line_len = line.len().saturating_sub(config.column_offset);
 
@@ -440,9 +599,32 @@ fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) -
 
         // erases part of the line to the right of the cursor
         buf_writer.write(b"\x1b[K")?;
-        if y < config.screen_rows - 1 {
+        buf_writer.write(b"\r\n")?;
+    }
+
+    Ok(())
+}
+
+fn editor_draw_bottom_status_bar(
+    buf_writer: &mut BufWriter<Stdout>,
+    config: &EditorConfig,
+) -> io::Result<()> {
+    // invert colors
+    // buf_writer.write(b"\x1b[7m")?;
+
+    for y in 0..3 {
+        // clear line
+        buf_writer.write(b"\x1b[2K")?;
+        // for _ in 0..config.screen_cols {
+        //     buf_writer.write(b" ")?;
+        // }
+        if y < 2 {
             buf_writer.write(b"\r\n")?;
         }
     }
+
+    // revert colors
+    // buf_writer.write(b"\x1b[7m")?;
+
     Ok(())
 }
