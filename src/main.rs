@@ -27,8 +27,8 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::io::{BufWriter, Read, Stdin, Stdout, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
 use std::process;
+use std::time::{Duration, SystemTime};
 use termios::*;
 
 const ESC: u8 = b'\x1b';
@@ -44,7 +44,6 @@ const HOME_KEY: u16 = 1006;
 const END_KEY: u16 = 1007;
 const DEL_KEY: u16 = 1008;
 const RONTO_VERSION: &'static str = "0.0.1";
-const RONTO_STATUS: &'static str = "  ronto 0.0.1";
 const NO_FILENAME: &'static str = "[No Name]";
 const TAB_STOP: usize = 8;
 
@@ -59,6 +58,8 @@ struct EditorConfig {
     screen_cols: usize,   // how many columns the terminal can display
     rows: Vec<ERow>,      // collection of rows for the file
     filename: String,
+    status_message: String,
+    status_message_time: SystemTime,
     orig_termios: Termios,
 }
 
@@ -90,6 +91,8 @@ fn main() {
         screen_cols: 0usize,
         rows: Vec::new(),
         filename: String::new(),
+        status_message: String::new(),
+        status_message_time: SystemTime::now(),
         orig_termios,
     };
 
@@ -107,6 +110,8 @@ fn main() {
     if let Err(e) = set_window_size(&mut stdin, &mut stdout, &mut config) {
         die(e)
     };
+
+    editor_set_status_message(&mut config, &["HELP: Ctrl-Q = quit"]);
 
     loop {
         if let Err(e) = editor_refresh_screen(&mut buf_writer, &mut config) {
@@ -190,6 +195,27 @@ fn editor_row_cursorx_to_renderx(row: &str, cx: usize) -> usize {
     }
 
     rx
+}
+
+/////////////////////////////////////// EDITOR OPERATIONS ////////////////////////////////
+
+fn editor_insert_char(config: &mut EditorConfig, c: u8) {
+    if config.cursor_y == config.rows.len() {
+        // CONSIDERATION: change into an associated function of ERow
+        let erow = ERow {
+            line: String::new(),
+            render: String::new(),
+        };
+        config.rows.push(erow);
+    }
+    //
+    // need to update the render string here in order to display it
+    // this could be better
+    //
+    let erow = &mut config.rows[config.cursor_y];
+    erow.line.insert(config.cursor_x, c as char);
+    erow.render = render_line(&erow.line);
+    config.cursor_x += 1;
 }
 
 /////////////////////////////////////// TERMINAL ////////////////////////////////////////
@@ -316,7 +342,7 @@ fn set_window_size(
         config.screen_cols = ws.ws_col as usize;
     }
 
-    config.screen_rows -= 4;
+    config.screen_rows -= 2;
     Ok(())
 }
 
@@ -391,7 +417,10 @@ fn editor_process_keypress(
             }
             Ok(None)
         }
-        _ => Ok(None),
+        _ => {
+            editor_insert_char(config, key as u8);
+            Ok(None)
+        }
     }
 }
 
@@ -448,7 +477,15 @@ fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
     }
 }
 
-//////////////////////////////////////// OUTPUT /////////////////////////////////////////
+//////////////////////////////////////// OUTPUT //////////////////////////////////////////
+
+fn editor_set_status_message(config: &mut EditorConfig, messages: &[&str]) {
+    for message in messages {
+        let status = format!("{} ", message);
+        config.status_message = status;
+        config.status_message_time = SystemTime::now();
+    }
+}
 
 fn editor_refresh_screen(
     buf_writer: &mut BufWriter<Stdout>,
@@ -461,9 +498,9 @@ fn editor_refresh_screen(
     // ansi cursor home code
     buf_writer.write(b"\x1b[H")?;
 
-    editor_draw_top_status_bar(buf_writer, config)?;
     editor_draw_rows(buf_writer, config)?;
-    editor_draw_bottom_status_bar(buf_writer, config)?;
+    editor_draw_status_bar(buf_writer, config)?;
+    editor_draw_message_bar(buf_writer, config)?;
 
     // CONSIDERATION: rewrite without making a heap allocation
     // let mut buf = [0u8, 32];
@@ -480,7 +517,7 @@ fn editor_refresh_screen(
 
     let cursor_pos = format!(
         "\x1b[{};{}H",
-        (config.cursor_y - config.row_offset) + 2,
+        (config.cursor_y - config.row_offset) + 1,
         (config.render_x - config.column_offset) + 1
     );
     buf_writer.write(cursor_pos.as_bytes())?;
@@ -514,47 +551,6 @@ fn editor_scroll(config: &mut EditorConfig) {
     if config.cursor_x >= config.column_offset + config.screen_cols {
         config.column_offset = config.render_x - config.screen_cols + 1;
     }
-}
-
-fn editor_draw_top_status_bar(
-    buf_writer: &mut BufWriter<Stdout>,
-    config: &EditorConfig,
-) -> io::Result<()> {
-    // clears line
-    buf_writer.write(b"\x1b[2K")?;
-    // invert colors
-    buf_writer.write(b"\x1b[7m")?;
-
-    buf_writer.write(RONTO_STATUS.as_bytes())?;
-
-    let filename = if !config.filename.is_empty() {
-        &config.filename
-    } else {
-        NO_FILENAME
-    };
-    let filename_len = filename.len();
-    let right_padding = (config.screen_cols - filename_len) / 2;
-    let left_padding = right_padding - RONTO_STATUS.len();
-
-    for _ in 0..left_padding {
-        buf_writer.write(b" ")?;
-    }
-
-    buf_writer.write(filename.as_bytes())?;
-
-    for _ in 0..right_padding {
-        buf_writer.write(b" ")?;
-    }
-
-    if filename_len % 2 == 0 {
-        buf_writer.write(b" ")?;
-    }
-
-    // reverts colors
-    buf_writer.write(b"\x1b[m")?;
-    // newline
-    buf_writer.write(b"\r\n")?;
-    Ok(())
 }
 
 fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) -> io::Result<()> {
@@ -605,26 +601,66 @@ fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) -
     Ok(())
 }
 
-fn editor_draw_bottom_status_bar(
+fn editor_draw_status_bar(
     buf_writer: &mut BufWriter<Stdout>,
     config: &EditorConfig,
 ) -> io::Result<()> {
     // invert colors
-    // buf_writer.write(b"\x1b[7m")?;
+    buf_writer.write(b"\x1b[7m")?;
+    // clear line
+    buf_writer.write(b"\x1b[2K")?;
 
-    for y in 0..3 {
-        // clear line
-        buf_writer.write(b"\x1b[2K")?;
-        // for _ in 0..config.screen_cols {
-        //     buf_writer.write(b" ")?;
-        // }
-        if y < 2 {
-            buf_writer.write(b"\r\n")?;
+    let filename = if !config.filename.is_empty() {
+        if config.filename.len() > 20 {
+            &config.filename[0..20]
+        } else {
+            &config.filename
         }
+    } else {
+        NO_FILENAME
+    };
+
+    let num_of_lines = config.rows.len();
+    let status = format!("{filename} - {num_of_lines} lines");
+    let line_pos = format!("{}/{}", config.cursor_y + 1, config.rows.len());
+
+    buf_writer.write(status.as_bytes())?;
+    let end = config.screen_cols - (status.len() + line_pos.len());
+    for _ in 0..end {
+        buf_writer.write(b" ")?;
     }
+    buf_writer.write(line_pos.as_bytes())?;
+
+    // newline
+    buf_writer.write(b"\r\n")?;
 
     // revert colors
-    // buf_writer.write(b"\x1b[7m")?;
+    buf_writer.write(b"\x1b[m")?;
+
+    Ok(())
+}
+
+fn editor_draw_message_bar(
+    buf_writer: &mut BufWriter<Stdout>,
+    config: &EditorConfig,
+) -> io::Result<()> {
+    // clear line
+    buf_writer.write(b"\x1b[2K")?;
+
+    let five_seconds = Duration::from_secs(5);
+
+    if SystemTime::now()
+        .duration_since(config.status_message_time)
+        .unwrap()
+        < five_seconds
+    {
+        let message = if config.status_message.len() > config.screen_cols {
+            &config.status_message[..config.screen_cols]
+        } else {
+            &config.status_message
+        };
+        buf_writer.write(message.as_bytes())?;
+    }
 
     Ok(())
 }
