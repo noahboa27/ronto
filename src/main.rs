@@ -52,8 +52,8 @@ const PAGE_DOWN: u16 = 1005;
 const HOME_KEY: u16 = 1006;
 const END_KEY: u16 = 1007;
 const DEL_KEY: u16 = 1008;
-const RONTO_VERSION: &'static str = "0.0.1";
-const NO_FILENAME: &'static str = "[No Name]";
+const RONTO_VERSION: &str = "0.0.1";
+const NO_FILENAME: &str = "[No Name]";
 const TAB_STOP: usize = 8;
 const RONTO_QUIT_TIMES: u8 = 3;
 
@@ -142,10 +142,8 @@ fn editor_open(config: &mut EditorConfig) -> io::Result<()> {
 
     for line in reader.lines() {
         let line = line?;
-        let render = render_line(&line);
-
-        let erow = ERow { line, render };
-        config.rows.push(erow);
+        let num_of_rows = config.rows.len();
+        editor_insert_row(config, line, num_of_rows);
     }
 
     Ok(())
@@ -191,10 +189,9 @@ fn editor_rows_to_string(config: &mut EditorConfig) -> String {
 
 //////////////////// ROW OPERATIONS ////////////////////
 
-// In kilo.c this is called 'editorUpdateRow'
-fn render_line(line: &str) -> String {
+fn editor_update_row(erow: &mut ERow) {
     let mut len: usize = 0;
-    for c in line.chars() {
+    for c in erow.line.chars() {
         if c == '\t' {
             len += TAB_STOP;
         } else {
@@ -204,7 +201,7 @@ fn render_line(line: &str) -> String {
     let mut render = String::with_capacity(len);
 
     let mut index: usize = 0;
-    for c in line.chars() {
+    for c in erow.line.chars() {
         if c == '\t' {
             render.push(' ');
             index += 1;
@@ -217,7 +214,7 @@ fn render_line(line: &str) -> String {
         }
     }
 
-    render
+    erow.render = render;
 }
 
 fn editor_row_cursorx_to_renderx(row: &str, cx: usize) -> usize {
@@ -234,39 +231,108 @@ fn editor_row_cursorx_to_renderx(row: &str, cx: usize) -> usize {
     rx
 }
 
-fn editor_append_row(config: &mut EditorConfig) {
+fn editor_insert_row(config: &mut EditorConfig, s: String, at: usize) {
+    if at > config.rows.len() {
+        return;
+    }
+
     // CONSIDERATION: change into an associated function of ERow
-    let erow = ERow {
-        line: String::new(),
+    let mut erow = ERow {
+        line: s,
         render: String::new(),
     };
-    config.rows.push(erow);
+    editor_update_row(&mut erow);
+    config.rows.insert(at, erow);
 }
 
-fn editor_row_insert_char(config: &mut EditorConfig, c: u8) {
+fn editor_del_row(config: &mut EditorConfig, at: usize) {
+    if at >= config.rows.len() {
+        return;
+    }
+    config.rows.remove(at);
+}
+
+fn editor_row_append_string(erow: &mut ERow, string: &str) {
+    erow.line.push_str(string);
+    editor_update_row(erow);
+}
+
+fn editor_row_insert_char(erow: &mut ERow, mut at: usize, c: u8) {
+    if at > erow.line.len() {
+        at = erow.line.len()
+    }
     //
     // need to update the render string here in order to display it.
     // this could be better.
     //
-    let erow = &mut config.rows[config.cursor_y];
-    erow.line.insert(config.cursor_x, c as char);
-    erow.render = render_line(&erow.line);
+    erow.line.insert(at, c as char);
+    editor_update_row(erow);
+}
+
+fn editor_row_del_char(erow: &mut ERow, at: usize) {
+    if at >= erow.line.len() {
+        return;
+    }
+    erow.line.remove(at);
+    editor_update_row(erow);
 }
 
 //////////////////// EDITOR OPERATIONS ////////////////////
 
 fn editor_insert_char(config: &mut EditorConfig, c: u8) {
     if config.cursor_y == config.rows.len() {
-        editor_append_row(config);
+        editor_insert_row(config, String::new(), 0);
     }
 
-    editor_row_insert_char(config, c);
+    let erow = &mut config.rows[config.cursor_y];
+    editor_row_insert_char(erow, config.cursor_x, c);
     config.cursor_x += 1;
     config.dirty = true;
 }
 
-fn editor_row_del_char(config: &mut EditorConfig) {
-    todo!();
+fn editor_del_char(config: &mut EditorConfig) {
+    let cx = config.cursor_x;
+    let cy = config.cursor_y;
+
+    if cy == config.rows.len() {
+        return;
+    }
+
+    if cx == 0 && cy == 0 {
+        return;
+    }
+
+    if cx > 0 {
+        let erow = &mut config.rows[cy];
+        editor_row_del_char(erow, cx - 1);
+        config.cursor_x -= 1;
+    } else {
+        config.cursor_x = config.rows[cy - 1].line.len();
+        // CONSIDERATION: don't clone
+        let string = config.rows[cy].line.clone();
+        let erow = &mut config.rows[cy - 1];
+        editor_row_append_string(erow, string.as_str());
+        editor_del_row(config, cy);
+        config.cursor_y -= 1;
+    }
+
+    config.dirty = true;
+}
+
+fn editor_insert_new_line(config: &mut EditorConfig) {
+    let (cx, cy) = (config.cursor_x, config.cursor_y);
+
+    if cx == 0 {
+        editor_insert_row(config, String::new(), cy);
+    } else {
+        let string_after_x = config.rows[cy].line.split_off(cx);
+        editor_insert_row(config, string_after_x, cy + 1);
+        editor_update_row(&mut config.rows[cy]);
+    }
+
+    config.cursor_y += 1;
+    config.cursor_x = 0;
+    config.dirty = true;
 }
 
 //////////////////// TERMINAL /////////////////////
@@ -324,11 +390,11 @@ fn disable_raw_mode(stdin_fd: i32, orig_termios: &Termios) {
 
 fn editor_read_key(stdin: &mut Stdin) -> u16 {
     let mut buf = [b'\0'; 1];
-    stdin.read(&mut buf).unwrap();
+    stdin.read_exact(&mut buf).unwrap();
 
     if buf[0] == ESC as u8 {
         let mut seq = [b' '; 3];
-        stdin.read(&mut seq).unwrap();
+        let _ = stdin.read(&mut seq).unwrap();
         let seq = seq.trim_ascii_end();
 
         if !seq[0].is_ascii() || !seq[1].is_ascii() {
@@ -408,7 +474,7 @@ fn get_window_size_from_cursor(stdin: &mut Stdin, stdout: &mut Stdout) -> (u16, 
     stdout.write_all(b"\x1b[6n").unwrap();
     stdout.flush().unwrap();
 
-    stdin.read(&mut buffer).unwrap();
+    let _ = stdin.read(&mut buffer).unwrap();
     let mut iter = buffer[2..].split(|num| !num.is_ascii_digit());
     let row_bytes = iter.next().unwrap();
     let col_bytes = iter.next().unwrap();
@@ -425,20 +491,30 @@ fn get_window_size_from_cursor(stdin: &mut Stdin, stdout: &mut Stdout) -> (u16, 
 
 //////////////////// INPUT /////////////////////
 
+fn editor_prompt() {
+    todo!();
+}
+
 fn editor_process_keypress(stdin: &mut Stdin, config: &mut EditorConfig) {
     let key: u16 = editor_read_key(stdin);
     match key {
         RETURN => {
-            todo!();
+            editor_insert_new_line(config);
         }
 
         CTRL_Q => {
             if config.dirty && config.quit_times > 0 {
-                editor_set_status_message(config, "don't do it!");
+                editor_set_status_message(
+                    config,
+                    &format!(
+                        "WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.",
+                        config.quit_times
+                    ),
+                );
                 config.quit_times -= 1;
                 return;
             }
-            shutdown(&config);
+            shutdown(config);
         }
 
         CTRL_S => {
@@ -456,7 +532,10 @@ fn editor_process_keypress(stdin: &mut Stdin, config: &mut EditorConfig) {
         }
 
         BACKSPACE | CTRL_H | DEL_KEY => {
-            todo!();
+            if key == DEL_KEY {
+                editor_move_cursor(ARROW_RIGHT, config);
+            }
+            editor_del_char(config);
         }
 
         ARROW_UP | ARROW_DOWN | ARROW_LEFT | ARROW_RIGHT => {
@@ -492,35 +571,37 @@ fn editor_process_keypress(stdin: &mut Stdin, config: &mut EditorConfig) {
 }
 
 fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
-    let row = if config.cursor_y >= config.rows.len() {
+    let (cx, cy) = (config.cursor_x, config.cursor_y);
+    let len = config.rows.len();
+    let row = if cy >= len {
         None
     } else {
-        Some(&config.rows[config.cursor_y])
+        Some(&config.rows[cy])
     };
 
     match key {
         ARROW_UP => {
-            if config.cursor_y != 0 {
+            if cy != 0 {
                 config.cursor_y -= 1
             }
         }
         ARROW_LEFT => {
-            if config.cursor_x != 0 {
+            if cx != 0 {
                 config.cursor_x -= 1
-            } else if config.cursor_y > 0 {
+            } else if cy > 0 {
                 config.cursor_y -= 1;
                 config.cursor_x = config.rows[config.cursor_y].line.len();
             }
         }
         ARROW_DOWN => {
-            if (config.cursor_y) < config.rows.len() {
+            if (cy) < len {
                 config.cursor_y += 1
             }
         }
         ARROW_RIGHT => {
-            if row.is_some() && config.cursor_x < row.unwrap().line.len() {
+            if row.is_some() && cx < row.unwrap().line.len() {
                 config.cursor_x += 1
-            } else if row.is_some() && config.cursor_x == row.unwrap().line.len() {
+            } else if row.is_some() && cx == row.unwrap().line.len() {
                 config.cursor_y += 1;
                 config.cursor_x = 0;
             }
@@ -528,18 +609,17 @@ fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
         _ => (),
     }
 
-    let row = if config.cursor_y >= config.rows.len() {
+    let row = if cy >= len {
         None
     } else {
-        Some(&config.rows[config.cursor_y])
+        Some(&config.rows[cy])
     };
 
-    let row_len = if row.is_some() {
-        row.unwrap().line.len()
-    } else {
-        0
+    let row_len = match row {
+        Some(row) => row.line.len(),
+        None => 0
     };
-    if config.cursor_x > row_len {
+    if cx > row_len {
         config.cursor_x = row_len
     }
 }
@@ -555,9 +635,9 @@ fn editor_refresh_screen(buf_writer: &mut BufWriter<Stdout>, config: &mut Editor
     editor_scroll(config);
 
     // hide the cursor
-    buf_writer.write(b"\x1b[?25l").unwrap();
+    buf_writer.write_all(b"\x1b[?25l").unwrap();
     // ansi cursor home code
-    buf_writer.write(b"\x1b[H").unwrap();
+    buf_writer.write_all(b"\x1b[H").unwrap();
 
     editor_draw_rows(buf_writer, config);
     editor_draw_status_bar(buf_writer, config);
@@ -581,10 +661,10 @@ fn editor_refresh_screen(buf_writer: &mut BufWriter<Stdout>, config: &mut Editor
         (config.cursor_y - config.row_offset) + 1,
         (config.render_x - config.column_offset) + 1
     );
-    buf_writer.write(cursor_pos.as_bytes()).unwrap();
+    buf_writer.write_all(cursor_pos.as_bytes()).unwrap();
 
     // show the cursor
-    buf_writer.write(b"\x1b[?25h").unwrap();
+    buf_writer.write_all(b"\x1b[?25h").unwrap();
     buf_writer.flush().unwrap();
 }
 
@@ -616,23 +696,23 @@ fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) {
     for y in 0..config.screen_rows {
         let filerow = y + config.row_offset;
         if filerow >= config.rows.len() {
-            if config.rows.len() == 0 && y == config.screen_rows / 3 {
+            if config.rows.is_empty() && y == config.screen_rows / 3 {
                 // CONSIDERATION: rewrite without making a heap allocation
                 // let mut buf = [0u8, 80];
                 // let welcome = write!(buf, "Ronto editor --version {}", RONTO_VERSION);
 
                 let welcome = format!("Ronto editor -- version {RONTO_VERSION}");
                 let mut padding = (config.screen_cols - welcome.len()) / 2;
-                buf_writer.write(b"~").unwrap();
+                buf_writer.write_all(b"~").unwrap();
                 padding -= 1;
                 while padding > 0 {
-                    buf_writer.write(b" ").unwrap();
+                    buf_writer.write_all(b" ").unwrap();
                     padding -= 1;
                 }
 
-                buf_writer.write(welcome.as_bytes()).unwrap();
+                buf_writer.write_all(welcome.as_bytes()).unwrap();
             } else {
-                buf_writer.write(b"~").unwrap();
+                buf_writer.write_all(b"~").unwrap();
             }
         } else {
             let line = &config.rows[filerow].render;
@@ -641,28 +721,28 @@ fn editor_draw_rows(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) {
 
             if line_len > config.screen_cols {
                 let line = &line[..config.screen_cols];
-                buf_writer.write(line.as_bytes()).unwrap();
+                buf_writer.write_all(line.as_bytes()).unwrap();
             } else {
                 let line = if line_len == 0 {
                     ""
                 } else {
                     &line[config.column_offset..]
                 };
-                buf_writer.write(line.as_bytes()).unwrap();
+                buf_writer.write_all(line.as_bytes()).unwrap();
             }
         }
 
         // erases part of the line to the right of the cursor
-        buf_writer.write(b"\x1b[K").unwrap();
-        buf_writer.write(b"\r\n").unwrap();
+        buf_writer.write_all(b"\x1b[K").unwrap();
+        buf_writer.write_all(b"\r\n").unwrap();
     }
 }
 
 fn editor_draw_status_bar(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) {
     // invert colors
-    buf_writer.write(b"\x1b[7m").unwrap();
+    buf_writer.write_all(b"\x1b[7m").unwrap();
     // clear line
-    buf_writer.write(b"\x1b[2K").unwrap();
+    buf_writer.write_all(b"\x1b[2K").unwrap();
 
     let filename = if !config.filename.is_empty() {
         if config.filename.len() > 20 {
@@ -679,24 +759,24 @@ fn editor_draw_status_bar(buf_writer: &mut BufWriter<Stdout>, config: &EditorCon
     let line_pos = format!("{}/{}", config.cursor_y + 1, config.rows.len());
     let modified = if config.dirty { " (modified)" } else { "" };
 
-    buf_writer.write(status.as_bytes()).unwrap();
-    buf_writer.write(modified.as_bytes()).unwrap();
+    buf_writer.write_all(status.as_bytes()).unwrap();
+    buf_writer.write_all(modified.as_bytes()).unwrap();
     let end = config.screen_cols - (status.len() + modified.len() + line_pos.len());
     for _ in 0..end {
-        buf_writer.write(b" ").unwrap();
+        buf_writer.write_all(b" ").unwrap();
     }
-    buf_writer.write(line_pos.as_bytes()).unwrap();
+    buf_writer.write_all(line_pos.as_bytes()).unwrap();
 
     // newline
-    buf_writer.write(b"\r\n").unwrap();
+    buf_writer.write_all(b"\r\n").unwrap();
 
     // revert colors
-    buf_writer.write(b"\x1b[m").unwrap();
+    buf_writer.write_all(b"\x1b[m").unwrap();
 }
 
 fn editor_draw_message_bar(buf_writer: &mut BufWriter<Stdout>, config: &EditorConfig) {
     // clear line
-    buf_writer.write(b"\x1b[2K").unwrap();
+    buf_writer.write_all(b"\x1b[2K").unwrap();
 
     let five_seconds = Duration::from_secs(5);
 
@@ -710,6 +790,6 @@ fn editor_draw_message_bar(buf_writer: &mut BufWriter<Stdout>, config: &EditorCo
         } else {
             &config.status_message
         };
-        buf_writer.write(message.as_bytes()).unwrap();
+        buf_writer.write_all(message.as_bytes()).unwrap();
     }
 }
