@@ -25,7 +25,7 @@ use std::env;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader};
-use std::io::{BufWriter, Read, Stdin, Stdout, Write};
+use std::io::{BufWriter, Read, Stdout, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::process;
@@ -88,10 +88,7 @@ fn main() {
         process::exit(1);
     }
 
-    let mut stdout = io::stdout();
-    let mut buf_writer = BufWriter::new(io::stdout());
-    let mut stdin = io::stdin();
-    let stdin_fd = stdin.as_raw_fd();
+    let stdin_fd = io::stdin().as_raw_fd();
     let orig_termios = Termios::from_fd(stdin_fd).unwrap();
     let mut config = EditorConfig {
         cursor_x: 0usize,
@@ -118,20 +115,24 @@ fn main() {
     }
 
     enable_raw_mode(stdin_fd);
-    set_window_size(&mut stdin, &mut stdout, &mut config);
+    set_window_size(&mut config);
 
     editor_set_status_message(&mut config, "HELP: Ctrl-S = save | Ctrl-Q = quit");
 
     // main loop
     loop {
-        editor_refresh_screen(&mut buf_writer, &mut config);
-        editor_process_keypress(&mut stdin, &mut config);
+        editor_refresh_screen(&mut config);
+        editor_process_keypress(&mut config);
     }
 }
 
 const fn ctrl_key(key: u8) -> u16 {
     // mask to strip away the CTRL key bits
     (key & 0x1f) as u16
+}
+
+fn is_ctrl(key: &u16) -> bool {
+    (0..=31).contains(key) || *key == 127
 }
 
 //////////////////// FILE I/O /////////////////////
@@ -151,7 +152,11 @@ fn editor_open(config: &mut EditorConfig) -> io::Result<()> {
 
 fn editor_save(config: &mut EditorConfig) {
     if config.filename.is_empty() {
-        return;
+        config.filename = editor_prompt(config, "Save as: {} (ESC to cancel)");
+        if config.filename.is_empty() {
+            editor_set_status_message(config, "Save aborted");
+            return;
+        }
     }
 
     let buf = editor_rows_to_string(config);
@@ -388,7 +393,8 @@ fn disable_raw_mode(stdin_fd: i32, orig_termios: &Termios) {
     tcsetattr(stdin_fd, TCSAFLUSH, orig_termios).unwrap();
 }
 
-fn editor_read_key(stdin: &mut Stdin) -> u16 {
+fn editor_read_key() -> u16 {
+    let mut stdin = io::stdin();
     let mut buf = [b'\0'; 1];
     stdin.read_exact(&mut buf).unwrap();
 
@@ -443,7 +449,7 @@ fn editor_read_key(stdin: &mut Stdin) -> u16 {
     }
 }
 
-fn set_window_size(stdin: &mut Stdin, stdout: &mut Stdout, config: &mut EditorConfig) {
+fn set_window_size(config: &mut EditorConfig) {
     let ws = winsize {
         ws_row: 0,
         ws_col: 0,
@@ -452,7 +458,7 @@ fn set_window_size(stdin: &mut Stdin, stdout: &mut Stdout, config: &mut EditorCo
     };
 
     if unsafe { ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 } || ws.ws_col == 0 {
-        let (rows, cols) = get_window_size_from_cursor(stdin, stdout);
+        let (rows, cols) = get_window_size_from_cursor();
         config.screen_rows = rows as usize;
         config.screen_cols = cols as usize;
     } else {
@@ -463,7 +469,9 @@ fn set_window_size(stdin: &mut Stdin, stdout: &mut Stdout, config: &mut EditorCo
     config.screen_rows -= 2;
 }
 
-fn get_window_size_from_cursor(stdin: &mut Stdin, stdout: &mut Stdout) -> (u16, u16) {
+fn get_window_size_from_cursor() -> (u16, u16) {
+    let mut stdin = io::stdin();
+    let mut stdout = io::stdout();
     // send cursor to bottom right
     stdout.write_all(b"\x1b[999C\x1b[999B").unwrap();
     stdout.flush().unwrap();
@@ -491,12 +499,41 @@ fn get_window_size_from_cursor(stdin: &mut Stdin, stdout: &mut Stdout) -> (u16, 
 
 //////////////////// INPUT /////////////////////
 
-fn editor_prompt() {
-    todo!();
+fn editor_prompt(config: &mut EditorConfig, prompt: &str) -> String {
+    let mut buf = String::with_capacity(128);
+
+    loop {
+        // FIXME: can't pass string args like i want to
+        let message = format!(prompt, buf);
+        editor_set_status_message(config, &message);
+        editor_refresh_screen(config);
+
+        let key = editor_read_key();
+        match key {
+            DEL_KEY | CTRL_H | BACKSPACE => {
+                buf.pop();
+            },
+            ESC => {
+                editor_set_status_message(config, "");
+                return String::new();
+            },
+            RETURN => {
+                if !buf.is_empty() {
+                    editor_set_status_message(config, "");
+                    return buf;
+                }
+            },
+            _ => {
+                if !is_ctrl(&key) && key < 128 {
+                    buf.push(key as u8 as char);
+                }
+            }
+        }
+    }
 }
 
-fn editor_process_keypress(stdin: &mut Stdin, config: &mut EditorConfig) {
-    let key: u16 = editor_read_key(stdin);
+fn editor_process_keypress(config: &mut EditorConfig) {
+    let key: u16 = editor_read_key();
     match key {
         RETURN => {
             editor_insert_new_line(config);
@@ -631,17 +668,18 @@ fn editor_set_status_message(config: &mut EditorConfig, message: &str) {
     config.status_message_time = SystemTime::now();
 }
 
-fn editor_refresh_screen(buf_writer: &mut BufWriter<Stdout>, config: &mut EditorConfig) {
+fn editor_refresh_screen(config: &mut EditorConfig) {
     editor_scroll(config);
+    let mut buf_writer = BufWriter::new(io::stdout());
 
     // hide the cursor
     buf_writer.write_all(b"\x1b[?25l").unwrap();
     // ansi cursor home code
     buf_writer.write_all(b"\x1b[H").unwrap();
 
-    editor_draw_rows(buf_writer, config);
-    editor_draw_status_bar(buf_writer, config);
-    editor_draw_message_bar(buf_writer, config);
+    editor_draw_rows(&mut buf_writer, config);
+    editor_draw_status_bar(&mut buf_writer, config);
+    editor_draw_message_bar(&mut buf_writer, config);
 
     // CONSIDERATION: rewrite without making a heap allocation
     // let mut buf = [0u8, 32];
