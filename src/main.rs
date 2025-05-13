@@ -38,10 +38,12 @@ const KEY_Q: u8 = b'q';
 const KEY_H: u8 = b'h';
 const KEY_L: u8 = b'l';
 const KEY_S: u8 = b's';
+const KEY_F: u8 = b'f';
 const CTRL_Q: u16 = ctrl_key(KEY_Q);
 const CTRL_H: u16 = ctrl_key(KEY_H);
 const CTRL_L: u16 = ctrl_key(KEY_L);
 const CTRL_S: u16 = ctrl_key(KEY_S);
+const CTRL_F: u16 = ctrl_key(KEY_F);
 const BACKSPACE: u16 = 127;
 const ARROW_UP: u16 = 1000;
 const ARROW_LEFT: u16 = 1001;
@@ -117,7 +119,7 @@ fn main() {
     enable_raw_mode(stdin_fd);
     set_window_size(&mut config);
 
-    editor_set_status_message(&mut config, "HELP: Ctrl-S = save | Ctrl-Q = quit");
+    editor_set_status_message(&mut config, "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
 
     // main loop
     loop {
@@ -152,7 +154,7 @@ fn editor_open(config: &mut EditorConfig) -> io::Result<()> {
 
 fn editor_save(config: &mut EditorConfig) {
     if config.filename.is_empty() {
-        config.filename = editor_prompt(config, "Save as: {} (ESC to cancel)");
+        config.filename = editor_prompt(config, "Save as: {} (ESC to cancel)", false);
         if config.filename.is_empty() {
             editor_set_status_message(config, "Save aborted");
             return;
@@ -192,6 +194,35 @@ fn editor_rows_to_string(config: &mut EditorConfig) -> String {
     buf
 }
 
+//////////////////// FIND ////////////////////
+
+fn editor_find(config: &mut EditorConfig, query_and_key: (&str, u16)) {
+    let (query, key) = query_and_key;
+    if key == ESC || key == RETURN {
+        return;
+    }
+
+    for i in 0..config.rows.len() {
+        let erow = &config.rows[i];
+        let match_index = erow.render.find(query);
+        match match_index {
+            Some(index) => {
+                config.cursor_y = i;
+                config.cursor_x = editor_row_renderx_to_cursorx(&erow.line, index);
+                config.row_offset = config.rows.len();
+                break;
+            },
+            None => {
+                // future error handling
+            }
+        }
+    }
+}
+
+fn editor_search(config: &mut EditorConfig) {
+    editor_prompt(config, "Search: {} (ESC to cancel)", true);
+}
+
 //////////////////// ROW OPERATIONS ////////////////////
 
 fn editor_update_row(erow: &mut ERow) {
@@ -228,12 +259,33 @@ fn editor_row_cursorx_to_renderx(row: &str, cx: usize) -> usize {
 
     for c in chars {
         if c == '\t' {
-            rx += (TAB_STOP - 1) - (rx % TAB_STOP);
+            rx += TAB_STOP;
+        } else {
+            rx += 1;
         }
-        rx += 1;
     }
 
     rx
+}
+
+fn editor_row_renderx_to_cursorx(row: &str, rx: usize) -> usize {
+    let mut cur_rx: usize = 0;
+    let mut cx: usize = 0;
+
+    for c in row.chars() {
+        if c == '\t' {
+            cur_rx += TAB_STOP;
+        } else {
+            cur_rx += 1;
+        }
+
+        if cur_rx > rx {
+            break;
+        }
+        cx += 1;
+    }
+    
+    cx
 }
 
 fn editor_insert_row(config: &mut EditorConfig, s: String, at: usize) {
@@ -395,25 +447,22 @@ fn disable_raw_mode(stdin_fd: i32, orig_termios: &Termios) {
 
 fn editor_read_key() -> u16 {
     let mut stdin = io::stdin();
-    let mut buf = [b'\0'; 1];
-    stdin.read_exact(&mut buf).unwrap();
+    let mut buf = [b' '; 4];
+    let _ = stdin.read(&mut buf).unwrap();
+    let buf = buf.trim_ascii_end();
 
     if buf[0] == ESC as u8 {
-        let mut seq = [b' '; 3];
-        let _ = stdin.read(&mut seq).unwrap();
-        let seq = seq.trim_ascii_end();
-
-        if !seq[0].is_ascii() || !seq[1].is_ascii() {
+        if buf.len() == 1 {
             return ESC;
         }
 
-        if seq[0] == b'[' {
-            if seq[1] >= b'0' && seq[1] <= b'9' {
-                if !seq[2].is_ascii() {
+        if buf[1] == b'[' {
+            if buf[2] >= b'0' && buf[2] <= b'9' {
+                if buf.len() == 3 {
                     return ESC;
                 }
-                if seq[2] == b'~' {
-                    match seq[1] {
+                if buf[3] == b'~' {
+                    match buf[2] {
                         b'1' => return HOME_KEY,
                         b'3' => return DEL_KEY,
                         b'4' => return END_KEY,
@@ -425,7 +474,7 @@ fn editor_read_key() -> u16 {
                     }
                 }
             } else {
-                match seq[1] {
+                match buf[2] {
                     b'A' => return ARROW_UP,
                     b'B' => return ARROW_DOWN,
                     b'C' => return ARROW_RIGHT,
@@ -435,8 +484,8 @@ fn editor_read_key() -> u16 {
                     _ => return 0u16,
                 }
             }
-        } else if seq[0] == b'O' {
-            match seq[1] {
+        } else if buf[1] == b'O' {
+            match buf[2] {
                 b'H' => return HOME_KEY,
                 b'F' => return END_KEY,
                 _ => return 0u16,
@@ -499,12 +548,11 @@ fn get_window_size_from_cursor() -> (u16, u16) {
 
 //////////////////// INPUT /////////////////////
 
-fn editor_prompt(config: &mut EditorConfig, prompt: &str) -> String {
+fn editor_prompt(config: &mut EditorConfig, prompt: &str, is_search: bool) -> String {
     let mut buf = String::with_capacity(128);
 
     loop {
-        // FIXME: can't pass string args like i want to
-        let message = format!(prompt, buf);
+        let message = prompt.replace("{}", &buf);
         editor_set_status_message(config, &message);
         editor_refresh_screen(config);
 
@@ -515,11 +563,17 @@ fn editor_prompt(config: &mut EditorConfig, prompt: &str) -> String {
             },
             ESC => {
                 editor_set_status_message(config, "");
+                if is_search {
+                    editor_find(config, (&buf, key));
+                }
                 return String::new();
             },
             RETURN => {
                 if !buf.is_empty() {
                     editor_set_status_message(config, "");
+                    if is_search {
+                        editor_find(config, (&buf, key));
+                    }
                     return buf;
                 }
             },
@@ -528,6 +582,10 @@ fn editor_prompt(config: &mut EditorConfig, prompt: &str) -> String {
                     buf.push(key as u8 as char);
                 }
             }
+        }
+
+        if is_search {
+            editor_find(config, (&buf, key));
         }
     }
 }
@@ -568,6 +626,10 @@ fn editor_process_keypress(config: &mut EditorConfig) {
             }
         }
 
+        CTRL_F => {
+            editor_search(config);
+        }
+
         BACKSPACE | CTRL_H | DEL_KEY => {
             if key == DEL_KEY {
                 editor_move_cursor(ARROW_RIGHT, config);
@@ -597,7 +659,9 @@ fn editor_process_keypress(config: &mut EditorConfig) {
             }
         }
 
-        CTRL_L | ESC => todo!(),
+        CTRL_L | ESC => {
+            // do nothing for now
+        },
 
         _ => {
             editor_insert_char(config, key as u8);
@@ -609,8 +673,8 @@ fn editor_process_keypress(config: &mut EditorConfig) {
 
 fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
     let (cx, cy) = (config.cursor_x, config.cursor_y);
-    let len = config.rows.len();
-    let row = if cy >= len {
+    let num_of_rows = config.rows.len();
+    let row = if cy >= num_of_rows {
         None
     } else {
         Some(&config.rows[cy])
@@ -631,7 +695,7 @@ fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
             }
         }
         ARROW_DOWN => {
-            if (cy) < len {
+            if (cy) < num_of_rows {
                 config.cursor_y += 1
             }
         }
@@ -646,7 +710,7 @@ fn editor_move_cursor(key: u16, config: &mut EditorConfig) {
         _ => (),
     }
 
-    let row = if cy >= len {
+    let row = if cy >= num_of_rows {
         None
     } else {
         Some(&config.rows[cy])
@@ -707,7 +771,7 @@ fn editor_refresh_screen(config: &mut EditorConfig) {
 }
 
 fn editor_scroll(config: &mut EditorConfig) {
-    config.render_x = config.cursor_x;
+    config.render_x = 0;
     if config.cursor_y < config.rows.len() {
         config.render_x =
             editor_row_cursorx_to_renderx(&config.rows[config.cursor_y].line, config.cursor_x);
